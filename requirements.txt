@@ -1,0 +1,14 @@
+laspy
+numpy
+matplotlib
+
+# Optional LAZ support:
+# laspy[lazrs]
+
+# Optional CRS transformation support. The current Windows environment may
+# block pyproj's native DLL; LAS inspection works without it.
+# pyproj
+
+# Optional Open3D processing/visualization. Install separately on a Python
+# version with a compatible wheel:
+# open3d
