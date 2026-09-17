@@ -1,0 +1,63 @@
+# Local LiDAR dataset
+TRD_MLS/
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+.venv*/
+venv/
+env/
+ENV/
+.env/
+.conda/
+
+# Packaging and build output
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+MANIFEST
+*.whl
+
+# Test, coverage, and type-checker output
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.mypy_cache/
+.pyre/
+.hypothesis/
+.ruff_cache/
+
+# Jupyter and local analysis output
+.ipynb_checkpoints/
+
+# Environment and local configuration
+.env.*
+!.env.example
+
+# IDE settings
+.vscode/
+.idea/
+
+# OS-generated files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
