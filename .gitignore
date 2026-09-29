@@ -39,6 +39,7 @@ htmlcov/
 
 # Jupyter and local analysis output
 .ipynb_checkpoints/
+reconstruction_output/
 
 # Environment and local configuration
 .env.*

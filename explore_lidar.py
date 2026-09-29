@@ -12,6 +12,7 @@ tiles into memory unless a caller explicitly chooses to do so.
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 from typing import Iterable
 
@@ -248,6 +249,237 @@ def print_histogram(label: str, values: np.ndarray, bins: int = 30) -> None:
         print(f"  {start:12.3f} .. {end:12.3f} | {'#' * width} {count:,}")
 
 
+def select_paths(paths: list[Path], tile: str | None) -> list[Path]:
+    """Select one named tile or retain the complete dataset."""
+    if tile is None:
+        return paths
+    selected = [path for path in paths if path.parent.name == tile]
+    if not selected:
+        raise SystemExit(f"No LAS/LAZ file found in tile folder {tile!r}")
+    return selected
+
+
+def aggregate_height_cells(path: Path, cell_size: float) -> dict[str, np.ndarray | float]:
+    """Aggregate a tile into a sparse XY grid without loading it all at once."""
+    if not math.isfinite(cell_size) or cell_size <= 0:
+        raise ValueError("cell_size must be finite and greater than zero")
+    with laspy.open(path) as reader:
+        minimum = np.asarray(reader.header.mins, dtype=np.float64)
+        maximum = np.asarray(reader.header.maxs, dtype=np.float64)
+        origin_x, origin_y = minimum[:2]
+        grid_width = max(int(np.ceil((maximum[0] - origin_x) / cell_size)) + 1, 1)
+        if reader.header.point_count == 0:
+            return {
+                "x_origin": origin_x,
+                "y_origin": origin_y,
+                "cell_size": cell_size,
+                "grid_width": grid_width,
+                "ix": np.array([], dtype=np.int64),
+                "iy": np.array([], dtype=np.int64),
+                "count": np.array([], dtype=np.int64),
+                "z_min": np.array([], dtype=np.float64),
+                "z_max": np.array([], dtype=np.float64),
+                "z_mean": np.array([], dtype=np.float64),
+                "z_std": np.array([], dtype=np.float64),
+                "intensity_mean": np.array([], dtype=np.float64),
+            }
+        partials: list[tuple[np.ndarray, ...]] = []
+        for points in reader.chunk_iterator(1_000_000):
+            x = np.asarray(points.x, dtype=np.float64)
+            y = np.asarray(points.y, dtype=np.float64)
+            z = np.asarray(points.z, dtype=np.float64)
+            intensity = np.asarray(points.intensity, dtype=np.float64)
+            ix = np.floor((x - origin_x) / cell_size).astype(np.int64)
+            iy = np.floor((y - origin_y) / cell_size).astype(np.int64)
+            cell_ids = iy * grid_width + ix
+            unique_ids, inverse = np.unique(cell_ids, return_inverse=True)
+            count = np.bincount(inverse).astype(np.int64)
+            sum_z = np.bincount(inverse, weights=z)
+            sum_z2 = np.bincount(inverse, weights=z * z)
+            sum_intensity = np.bincount(inverse, weights=intensity)
+            min_z = np.full(len(unique_ids), np.inf)
+            max_z = np.full(len(unique_ids), -np.inf)
+            np.minimum.at(min_z, inverse, z)
+            np.maximum.at(max_z, inverse, z)
+            partials.append((unique_ids, count, sum_z, sum_z2, sum_intensity, min_z, max_z))
+
+    ids = np.concatenate([part[0] for part in partials])
+    unique_ids, inverse = np.unique(ids, return_inverse=True)
+    cell_count = np.zeros(len(unique_ids), dtype=np.int64)
+    total_z = np.zeros(len(unique_ids), dtype=np.float64)
+    total_z2 = np.zeros(len(unique_ids), dtype=np.float64)
+    total_intensity = np.zeros(len(unique_ids), dtype=np.float64)
+    cell_min = np.full(len(unique_ids), np.inf)
+    cell_max = np.full(len(unique_ids), -np.inf)
+    offset = 0
+    for part in partials:
+        length = len(part[0])
+        target = inverse[offset : offset + length]
+        np.add.at(cell_count, target, part[1])
+        np.add.at(total_z, target, part[2])
+        np.add.at(total_z2, target, part[3])
+        np.add.at(total_intensity, target, part[4])
+        np.minimum.at(cell_min, target, part[5])
+        np.maximum.at(cell_max, target, part[6])
+        offset += length
+    mean_z = total_z / cell_count
+    variance = np.maximum(total_z2 / cell_count - mean_z * mean_z, 0.0)
+    ix = unique_ids % grid_width
+    iy = unique_ids // grid_width
+    return {
+        "x_origin": origin_x,
+        "y_origin": origin_y,
+        "cell_size": cell_size,
+        "grid_width": grid_width,
+        "ix": ix.astype(np.int64),
+        "iy": iy.astype(np.int64),
+        "count": cell_count,
+        "z_min": cell_min,
+        "z_max": cell_max,
+        "z_mean": mean_z,
+        "z_std": np.sqrt(variance),
+        "intensity_mean": total_intensity / cell_count,
+    }
+
+
+def export_height_maps(paths: Iterable[Path], output_dir: Path, cell_size: float) -> None:
+    """Write sparse 2.5D height/intensity maps, one compressed file per tile."""
+    if not math.isfinite(cell_size) or cell_size <= 0:
+        raise ValueError("cell_size must be finite and greater than zero")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for path in paths:
+        result = aggregate_height_cells(path, cell_size)
+        output_path = output_dir / f"{path.parent.name}_{path.stem}_{path.suffix[1:]}_height_{cell_size:.6g}m.npz"
+        np.savez_compressed(output_path, **result)
+        print(
+            f"Wrote {output_path}: {len(result['count']):,} occupied cells, "
+            f"cell size {cell_size:g} m"
+        )
+
+
+def aggregate_voxel_cells(path: Path, voxel_size: float) -> dict[str, np.ndarray | float]:
+    """Aggregate a tile into sparse 3D voxels and estimate upward-oriented normals."""
+    if not math.isfinite(voxel_size) or voxel_size <= 0:
+        raise ValueError("voxel_size must be finite and greater than zero")
+    with laspy.open(path) as reader:
+        minimum = np.asarray(reader.header.mins, dtype=np.float64)
+        origin = minimum
+        if reader.header.point_count == 0:
+            empty = np.empty((0,), dtype=np.float64)
+            return {
+                "x_origin": origin[0],
+                "y_origin": origin[1],
+                "z_origin": origin[2],
+                "voxel_size": voxel_size,
+                "ix": np.empty(0, dtype=np.int64),
+                "iy": np.empty(0, dtype=np.int64),
+                "iz": np.empty(0, dtype=np.int64),
+                "count": np.empty(0, dtype=np.int64),
+                "x": empty,
+                "y": empty,
+                "z": empty,
+                "intensity_mean": empty,
+                "normal_x": empty,
+                "normal_y": empty,
+                "normal_z": empty,
+                "normal_valid": np.empty(0, dtype=bool),
+                "normal_orientation": "hemisphere_z_positive",
+            }
+        partials: list[tuple[np.ndarray, ...]] = []
+        for points in reader.chunk_iterator(1_000_000):
+            xyz = np.column_stack((points.x, points.y, points.z)).astype(np.float64)
+            intensity = np.asarray(points.intensity, dtype=np.float64)
+            scaled = np.floor((xyz - origin) / voxel_size)
+            if np.any(np.abs(scaled) > np.iinfo(np.int64).max):
+                raise ValueError(f"voxel_size {voxel_size:g} produces indices outside int64 range")
+            keys = scaled.astype(np.int64)
+            unique_keys, inverse = np.unique(keys, axis=0, return_inverse=True)
+            partials.append(
+                (
+                    unique_keys,
+                    np.bincount(inverse).astype(np.int64),
+                    np.column_stack(
+                        [np.bincount(inverse, weights=xyz[:, axis]) for axis in range(3)]
+                    ),
+                    np.bincount(inverse, weights=intensity),
+                )
+            )
+
+    keys = np.concatenate([part[0] for part in partials])
+    unique_keys, inverse = np.unique(keys, axis=0, return_inverse=True)
+    count = np.zeros(len(unique_keys), dtype=np.int64)
+    sum_xyz = np.zeros((len(unique_keys), 3), dtype=np.float64)
+    sum_intensity = np.zeros(len(unique_keys), dtype=np.float64)
+    offset = 0
+    for part in partials:
+        length = len(part[0])
+        target = inverse[offset : offset + length]
+        np.add.at(count, target, part[1])
+        for axis in range(3):
+            np.add.at(sum_xyz[:, axis], target, part[2][:, axis])
+        np.add.at(sum_intensity, target, part[3])
+        offset += length
+
+    centers = sum_xyz / count[:, None]
+    lookup = {tuple(key): index for index, key in enumerate(unique_keys.tolist())}
+    normals = np.zeros_like(centers)
+    normal_valid = np.zeros(len(centers), dtype=bool)
+    for index, key in enumerate(unique_keys):
+        neighbor_indices = []
+        for offset in np.ndindex(3, 3, 3):
+            if offset == (1, 1, 1):
+                continue
+            neighbor_key = tuple(key + np.asarray(offset) - 1)
+            if neighbor_key in lookup:
+                neighbor_indices.append(lookup[neighbor_key])
+        if len(neighbor_indices) < 3:
+            continue
+        neighborhood = centers[np.asarray(neighbor_indices)]
+        covariance = neighborhood - neighborhood.mean(axis=0)
+        _, singular_values, vectors = np.linalg.svd(covariance, full_matrices=False)
+        if singular_values[1] <= max(singular_values[0] * 1e-6, 1e-9):
+            continue
+        normal = vectors[-1]
+        normals[index] = normal if normal[2] >= 0 else -normal
+        normal_valid[index] = True
+
+    return {
+        "x_origin": origin[0],
+        "y_origin": origin[1],
+        "z_origin": origin[2],
+        "voxel_size": voxel_size,
+        "ix": unique_keys[:, 0],
+        "iy": unique_keys[:, 1],
+        "iz": unique_keys[:, 2],
+        "count": count,
+        "x": centers[:, 0],
+        "y": centers[:, 1],
+        "z": centers[:, 2],
+        "intensity_mean": sum_intensity / count,
+        "normal_x": normals[:, 0],
+        "normal_y": normals[:, 1],
+        "normal_z": normals[:, 2],
+        "normal_valid": normal_valid,
+        "normal_orientation": "hemisphere_z_positive",
+    }
+
+
+def export_surfels(paths: Iterable[Path], output_dir: Path, voxel_size: float) -> None:
+    """Write sparse voxel centroids with intensity and local PCA normals."""
+    if not math.isfinite(voxel_size) or voxel_size <= 0:
+        raise ValueError("voxel_size must be finite and greater than zero")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for path in paths:
+        result = aggregate_voxel_cells(path, voxel_size)
+        output_path = output_dir / f"{path.parent.name}_{path.stem}_{path.suffix[1:]}_surfels_{voxel_size:.6g}m.npz"
+        np.savez_compressed(output_path, **result)
+        valid_normals = int(np.count_nonzero(result["normal_valid"]))
+        print(
+            f"Wrote {output_path}: {len(result['count']):,} surfels, "
+            f"{valid_normals:,} with estimated normals, voxel size {voxel_size:g} m"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=Path("TRD_MLS"))
@@ -257,15 +489,35 @@ def main() -> None:
     parser.add_argument("--inspect", action="store_true", help="Print metadata for every tile")
     parser.add_argument("--plot", action="store_true", help="Show elevation and intensity histograms")
     parser.add_argument("--process", action="store_true", help="Downsample, clean, estimate normals, and view")
+    parser.add_argument("--height-map", action="store_true", help="Export sparse 2.5D height and intensity maps")
+    parser.add_argument("--surfels", action="store_true", help="Export sparse voxel centroids and normals")
+    parser.add_argument("--output-dir", type=Path, default=Path("reconstruction_output"))
     args = parser.parse_args()
+
+    if (args.plot or args.process or not (args.height_map or args.surfels)) and args.sample_points < 1:
+        raise SystemExit("--sample-points must be positive")
+    if not math.isfinite(args.voxel_size) or args.voxel_size <= 0:
+        raise SystemExit("--voxel-size must be finite and greater than zero")
 
     paths = find_tiles(args.data_dir)
     if not paths:
         raise SystemExit(f"No .las or .laz files found under {args.data_dir.resolve()}")
-    if args.inspect or not (args.plot or args.process):
+    if args.height_map and args.surfels:
+        raise SystemExit("Choose either --height-map or --surfels")
+    if (args.height_map or args.surfels) and (args.plot or args.process):
+        raise SystemExit("Reconstruction exports cannot be combined with --plot or --process")
+    if args.inspect or not (args.plot or args.process or args.height_map or args.surfels):
         inspect_tiles(paths)
 
-    selected = next((path for path in paths if args.tile and path.parent.name == args.tile), paths[0])
+    reconstruction_paths = select_paths(paths, args.tile)
+    if args.height_map:
+        export_height_maps(reconstruction_paths, args.output_dir, args.voxel_size)
+        return
+    if args.surfels:
+        export_surfels(reconstruction_paths, args.output_dir, args.voxel_size)
+        return
+
+    selected = reconstruction_paths[0]
     print(f"\nSelected tile: {selected}")
     sample = read_sample(selected, args.sample_points)
     print_distributions(sample)
